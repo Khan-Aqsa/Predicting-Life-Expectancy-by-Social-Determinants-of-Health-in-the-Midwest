@@ -1,0 +1,822 @@
+---
+title: "Predicting Life Expectancy by Social Determinants of Health in the Midwest"
+author: "Aqsa Khan"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: TRUE
+    code_folding: show
+    code_download: TRUE
+---
+
+# Preliminaries
+
+## My Packages
+
+```{r, message = FALSE, cache = FALSE}
+
+library(knitr)
+library(rmdformats)
+
+options(max.print="150"); opts_chunk$set(comment=NA); opts_knit$set(width=75)
+```
+
+```{r, message = FALSE}
+
+library(broom)
+library(car)
+library(equatiomatic)
+library(gt)
+library(gtExtras)
+library(kableExtra)
+library(ggrepel)
+library(ggdist)
+library(janitor)
+library(naniar)
+library(patchwork)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+## Data Ingest
+ 
+I'll be using County Health Rankings 2022 data. The code below loads the data directly from the website.
+
+```{r read_in_data_here, message = FALSE}
+data_url <- "https://www.countyhealthrankings.org/sites/default/files/media/document/analytic_data2022.csv"
+
+chr_2022_raw <- read_csv(data_url, skip = 1, guess_max = 4000,
+                         show_col_types = FALSE)
+```
+
+# Data Development
+
+## Selecting My Data
+
+I'll be selecting data from the four "states" (Kansas, Missouri, North Dakota, Ohio) and selecting five variables (v147, v145, v021, v023 and v139). Four of the five variables I'll be selecting are listed as proportion, instead of percentages, so I'll be re-scaling those, as well. Using this data, I will predict the life expectancy using social determinants of health (SDOH) in the Midwestern states.
+
+```{r}
+
+chr_2022 <- chr_2022_raw |>
+    filter(county_ranked == 1) |>
+    filter(state %in% c( "KS", "MS", "ND", "OH")) |>
+    select(fipscode, state, county,county_ranked, 
+           v147_rawvalue, v070_rawvalue, v069_rawvalue, 
+           v023_rawvalue, v063_rawvalue) |>
+    rename(life_expectancy = v147_rawvalue,
+           physical_inactivity = v070_rawvalue,
+           some_college = v069_rawvalue,
+           unemployment = v023_rawvalue,
+           median_household_income = v063_rawvalue) |>
+    mutate(physical_inactivity = 100*physical_inactivity,
+           some_college = 100*some_college,
+           unemployment = 100*unemployment)
+           
+```
+
+## Repairing the `fipscode` and factoring the `state`
+
+```{r}
+chr_2022 <- chr_2022 |>
+    mutate(fipscode = str_pad(fipscode, 5, pad = "0"),
+           state = factor(state))
+```
+
+### Checking Initial Work
+
+Given the "states" I selected, I should have 322 rows, since there are 322 counties across those states, and I should have 9 columns (variables). 
+
+```{r}
+glimpse(chr_2022)
+```
+
+Looks good. Checking to see that each of my states has the anticipated number of counties, too.
+
+```{r}
+chr_2022 |> tabyl(state) |> adorn_pct_formatting() 
+```
+
+Looks good too.
+
+## Creating Binary Categorical Variables
+
+First, I will make a binary categorical variable using the `unemployment` variable. 
+
+### Splitting into two categories based on the median
+
+```{r, message = FALSE}
+chr_2022 <- chr_2022 |>
+    mutate(temp1 = case_when(
+                   unemployment < median(unemployment) ~ "low",
+                   TRUE ~ "high"),
+           temp1 = factor(temp1))
+
+mosaic::favstats(unemployment ~ temp1, data = chr_2022) |> 
+    kable(digits = 3)
+```
+
+### Cleaning up
+
+```{r}
+chr_2022 <- chr_2022 |>
+    rename(unemp_cat = temp1) 
+```
+
+Confirming I have added the `unemp_cat` column to the data.
+
+```{r}
+names(chr_2022)
+```
+
+Ensuring no new counties were added. 
+
+```{r}
+nrow(chr_2022)
+```
+
+OK. Still looks fine.
+
+## Creating Multi-Category Variables
+
+I'll be selecting `median_household_income` as my multi-category variable. 
+
+### Creating a Three-Category Variable
+
+I'll be using the`cut2` function from the `Hmisc` package to create three groups of equal size.
+
+```{r}
+chr_2022 <- chr_2022 |>
+    mutate(temp2 = factor(Hmisc::cut2(median_household_income, g = 3)))
+
+mosaic::favstats( median_household_income ~ temp2, data = chr_2022) |> 
+    kable(digits = 3)
+```
+
+```{r}
+chr_2022 <- chr_2022 |>
+    mutate(temp2 = factor(Hmisc::cut2(median_household_income, g = 3)),
+           temp3_newnames = fct_recode(temp2,
+                                   low = "[30003, 49925)",
+                                   middle = "[49925, 58302)",
+                                   high = "[58302,114423]"))
+
+mosaic::favstats(median_household_income ~ temp3_newnames, data = chr_2022) |> 
+    kable(digits = 3)
+```
+
+### Cleaning up
+ 
+```{r}
+chr_2022 <- chr_2022 |> 
+  rename(mhi_cat = temp3_newnames) |>
+    select(-c(temp2))
+```
+
+ 
+## Revise order of variables
+
+I'd put `county_ranked` at the end of our list of variables, which we can do like this:
+
+```{r}
+chr_2022 <- chr_2022 |> relocate(county_ranked, .after = last_col())
+```
+
+This will make things easier to see when I print the tibble.
+
+## Three Important Checks
+
+Checking for missing data.
+
+```{r}
+chr_2022 |> 
+    miss_var_summary()
+```
+
+There is some missing data in one of the variables. I'll be summarizing the missing data on life expectancy by states.
+
+
+```{r, message = FALSE}
+mosaic::favstats(life_expectancy ~ state, data = chr_2022) |>
+    select(state, n, missing) |>
+    mutate(pct_available = 100*(n - missing)/n) |>
+    kable()
+```
+
+
+Checking that the raw versions of each of my five selected variables have at least 10 distinct non-missing values.
+
+```{r}
+chr_2022|> 
+    summarize(across(life_expectancy:median_household_income, ~ n_distinct(.)))
+```
+
+OK. We're fine there.
+
+Checking that every level of the resulting factor includes at least 10 counties.
+
+```{r}
+chr_2022 |> tabyl(unemp_cat)
+chr_2022 |> tabyl(mhi_cat)
+```
+
+OK. I have at least 10 counties in each category for each of the categorical variables that I created.
+
+# Our Analytic Tibble
+
+## Printing My Tibble
+
+Creating a tibble to confirm I have 11 columns with 322 counties (rows).
+
+```{r}
+chr_2022
+```
+
+Looks good so far. I think we are ready to go.
+
+## Summarizing our Tibble
+
+Here's where I'd run `describe` from the `Hmisc` package for one last check.
+
+```{r}
+Hmisc::describe(chr_2022)
+```
+
+## Saving the Tibble
+
+Now that I've finished changing the tibble, I'll save it as an R data set into the same location as my original data set within our R Project directory.
+
+```{r}
+saveRDS(chr_2022, file = "chr_2022_Aqsa_Khan.Rds")
+```
+
+# Codebook
+
+## Table of States with County Counts
+
+This is a table of the states included in my tibble. I have selected 4 states with 322 counties in total. The states I selected are Missouri (82 counties), Kansas (104 counties), Ohio (88 counties) and North Dakota (48 counties). While I currently live in Ohio, I would like to explore the other three states as I have friends and relatives there.
+
+```{r}
+chr_2022 |> tabyl(state) |> adorn_pct_formatting() |> adorn_totals() |> 
+  gt()
+```
+
+## Table of Variables, Descriptions and Roles
+
+
+Variable | v Code | Description | Analytic Role | NAs
+--------- | ----- | :-----------------------------: | ---------- | --
+`fipscode` | -- | FIPS code | ID | 0
+`county` | -- | County Name (my data includes **322** counties) | -- | 0
+`state` | -- | State: my **four** states are OH, KS, ND, MS | state | 0
+`life_expectancy` | v147_rawvalue | Average life expectancy, in years | outcome | 3
+`physical_inactivity` | v070_rawvalue | % of adults with no leisure time physical activity  | quantitative predictor | 0
+`some_college` | v069_rawvalue | % of the population aged 25-44 with some post-secondary education | quantitative predictor | 0
+`unemployment` | v023_rawvalue | Unemployment Rate, % | -- | 0
+`unemp_cat` | v023_rawvalue | 2 levels: low = unemployment below 4.3%, or high, | binary predictor | 0
+`median_household_income` | v063_rawvalue | median household income level of county (in $) | -- | 0
+`mhi_cat` | v063_rawvalue | 3 levels: low = MHI below $49,925, middle = MHI from $49,925 up to but not including $58,302, high = MHI from $58302 up to $114,423 | multi-category predictor | 0
+`county_ranked` | -- | 1 for all counties in my tibble | -- | 0
+
+
+# Biggest Challenge
+
+The most difficult part for me was using the Hmisc function to create category variables. Every time I wrote the code for creating 3 categories for my median_household_income variable, there was an error. I got confused with the 'temp_names' that I provided for my data. Eventually, I took a break and rewrote the whole chunk of code and it came out perfect this time. Another problem that I struggled with was selection of my categorical variables. So, I read about them on the CHR website to understand what these values indicate. This really helped me decide my variables for this project. 
+
+## Proposal Requirement 1 
+
+I have selected 4 states with 322 counties in total. The states I selected are Missouri (82 counties), Kansas (104 counties), Ohio (88 counties) and North Dakota (48 counties). While I currently live in Ohio, I would like to explore the other three states as I have friends and relatives there. 
+
+```{r}
+chr_2022 |> tabyl(state) |> adorn_pct_formatting() 
+``` 
+
+## Proposal Requirement 2
+
+List of variables that I selected are as follows-
+
+A. v147_rawvalue renamed "life_expectancy". This variable will be my **outcome**. According to the CHR website, life expectancy measures the average number of years from birth a person can expect to live, according to the current mortality experience (age-specific death rates) of the population. A wide range of SDOH tend to affect the quality of life and health outcomes.  
+
+B. v070_rawvalue renamed "physical_inactivity". Indicates the percentage of adults ages 18 and over reporting no leisure-time physical activity in the past month. Reduced physical activity has been related to onset of life threatening diseases that may lead to premature mortality. 
+
+C. v069_rawvalue renamed "some_college". Indicates the percentage of the population ages 25-44 with some post-secondary education. Higher level of education correlates strongly with high job opportunities, improved economic conditions and less stressful life eventually resulting in a healthier lifestyle. 
+
+D. v023_rawvalue renamed "unemployment". Indicates the percentage of population ages 16 and older unemployed but seeking work. Higher unemployment increases the risk of unhealthy living conditions, lost of health insurance, increased stress and mortality. I have created two categories of this variable i.e., low = below 4.3% or high.
+
+E. v063_rawvalue renamed "median_household_income". Measures the median household income in US dollars. Higher income associates with healthier lifestyle, increased access to healthcare and lower risks of premature deaths. I have created three levels for this variable i.e., low = MHI below $49,925, middle = MHI from $49,925 up to but not including $58,302, high = MHI from $58302 up to $114,423.
+
+## Proposal Requirement 3
+
+Print of my tibble with 11 columns and 322 rows (counties)
+
+```{r}
+chr_2022
+```
+
+## Proposal Requirement 4
+
+```{r}
+Hmisc::describe(chr_2022)
+```
+
+# Analysis 1
+
+## The Variables
+
+In analysis 1, I will be using physical_inactivity (variable 2) as my predictor to measure my outcome of interest i.e., life_expectancy (variable 1). The physical inactivity variable (predictor) indicates the percentage of adults with no leisure time physical activity. While, the life expectancy variable indicates the average number of years from birth a person can expect to live. 
+
+Using mosaic favstats, I have created a tibble for my outcome i.e., life expectancy in the four states KS, MS, ND and OH to check for complete cases.
+```{r}
+mosaic::favstats(life_expectancy ~ state, data = chr_2022) |>
+    kable(dig=2) |> kable_styling(font_size = 18)
+```
+In the four states of OH, MS, KS and ND, out of the 322, only 319 counties have complete data for my outcome i.e., life expectancy.
+
+Again using mosaic favstats, I have created a tibble for my quantitative predictor i.e., physical inactivity states in the four states KS, MS, ND and OH to check for complete cases.
+```{r}
+mosaic::favstats(physical_inactivity ~ state, data = chr_2022) |>
+    kable(dig=2) |> kable_styling(font_size = 18)
+```
+In all four states of OH, MS, KS and ND, 322 counties have complete data for my quantitative predictor i.e., physical inactivity.
+
+```{r}
+chr_2022 |>
+    filter(state == "OH") |>
+    filter(county == "Cuyahoga County") |>
+    select(state, county, life_expectancy, physical_inactivity)
+```
+In Cuyahoga county, Ohio, the 28.5% of adult population has no time for physical activity with an average life expectancy of 76.48 years.  
+
+## Research Question
+
+What is the nature of the association between physical inactivity and life expectancy, in 319 counties in the states of OH, MS, KS, ND?
+
+## Data Visualization
+
+I have filtered complete cases and created analysis1. Since, only 3 counties have missing values for my outcome (i.e., life expectancy) which is quite a small number, that is why, I decided not to impute the data. 
+Using complete cases, I have created a scatter plot for my outcome (life expectancy) and predictor (physical inactivity).
+```{r}
+analysis1 <- chr_2022 |> filter(complete.cases(physical_inactivity, life_expectancy, state))
+
+analysis1_plot1 <- ggplot(data = analysis1, aes(x = physical_inactivity, y = life_expectancy)) +
+  geom_point() +
+  geom_smooth(method = "lm",se = FALSE, formula= y ~ x,  col = "red") +
+  geom_smooth(method = "loess", se = FALSE, formula= y ~ x, col = "blue") +
+  geom_label(aes(x = 45, y = 90,label = "Life expectancy = 88.35 - 0.37 Physical inactivity"), size = 3, color = "red") +
+  labs(title = "Predicting Life Expectancy by Physical Inactivity in OH, MS, KS, ND",
+subtitle= "As county's proportion of physically inactive adults increases, avg. life expectancy decreases",
+       x = "Percentage of adults with no time for physical activity", 
+       y = "Average life expectancy (in years)",
+       caption = "Linear model in red and loess smooth in blue")
+
+analysis1_plot1
+```
+
+As a county's proportion of adults with no leisure time for physical activity increases, the average life expectancy shortens, which seems like a negative association. Most of the data points are clustered to the straight line which indicates a moderate to strong negative association. The loess smooth line almost superimposes the straight line which tells us that a linear regression model might fit the data. However, there are a few outlier values further away from the general pattern.
+
+
+## Transformation Assessment
+
+I have used the boxcox approach to identify which transformation on the Tukey's ladder fit best for my model. 
+```{r}
+boxCox(analysis1$life_expectancy ~ analysis1$physical_inactivity)
+powerTransform(analysis1$life_expectancy ~ analysis1$physical_inactivity)
+```
+
+The boxcox plot peaks at a lambda value of 0.73, which is more close to 1 but also close to 0.5. Based on Tukey's ladder of power transformation, I have created a scatter plot of square root transformation for my outcome and compared it with my untransformed outcome. 
+
+```{r}
+p1 <- ggplot(analysis1, aes(x = physical_inactivity, y = life_expectancy)) +
+    geom_point(size = 2) +
+    geom_smooth(method = "loess", se = FALSE, 
+                formula = y ~ x, col = "dodgerblue") +
+    geom_smooth(method = "lm", se = FALSE, 
+                formula = y ~ x, col = "red", linetype = "dashed") +
+    labs(title = "Plot1: Y vs. X")
+
+p2 <- ggplot(analysis1, aes(x = physical_inactivity, y = sqrt(life_expectancy))) +
+    geom_point(size = 2) +
+    geom_smooth(method = "loess", se = FALSE, 
+                formula = y ~ x, col = "dodgerblue") +
+    geom_smooth(method = "lm", se = FALSE, 
+                formula = y ~ x, col = "red", linetype = "dashed") +
+    labs(title = "Plot2: Square Root of Y vs. X")
+
+p1 + p2
+```
+
+Since no other meaningful observation can be made through the square root transformation plot compared with the untransformed plot, I have decided to stick with my original version (untransformed) of the outcome.
+
+## The Fitted Model
+
+### The Prediction Equation
+```{r}
+analysis1_model <- lm(life_expectancy ~ physical_inactivity, data = analysis1)
+extract_eq(analysis1_model, use_coefs = TRUE, coef_digits = 2)
+```
+The straight line model for these data fitted by least squares is life expectancy = 88.35 - 0.37 physical inactivity. The slope of physical inactivity is negative, which indicates that as the percentage of adults with no time for physical activity increases, we expect that average life expectancy decreases. Specifically, we expect that for every additional increase in % of adults with no time for physical activity, the average life expectancy will be 0.37 years shorter.
+
+### The Model Coefficients
+```{r}
+m1 <-lm(life_expectancy ~ physical_inactivity, data = analysis1)
+tidy(m1, conf.int = TRUE, conf.level = 0.90) |> 
+ kable(dig=1) |> kable_styling(font_size = 18)
+```
+
+In m1, my point estimate for life expectancy mean is 88.4 and the slope of my predictor is -0.4, which implies that for every 1% increase in physical_inactivity the prediction says that there is an expected decrease in 0.34 years in life expectancy and the 90% confidence level around it is -0.4 and -0.3. Which means that I can be confident that if I were to re-fit this model with 100 random samples of the same size, from the same population, approximately 95/100 of the confidence intervals would contain the population value for that slope.
+
+### Summaries of Model Fit
+```{r}
+glance(m1) |>
+  select(r.squared, adj.r.squared, sigma, nobs, df, df.residual) |>
+   kbl(digits = c(4, 4, 3, 0, 0)) |> kable_styling(font_size = 18)
+```
+
+The R-squared (squared correlation coefficient) value for 319 observations is 0.463, which implies that 46.3% of the variation in life expectancy is explained using this linear model with physical inactivity. The residual standard error is 2.404 years.
+
+## Residual Analysis
+```{r}
+analysis1_aug <- augment(analysis1_model, data = analysis1)
+
+analysis1_plot2 <- ggplot(analysis1_aug, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.2) +
+  geom_point(data=analysis1_aug |> 
+               slice_max(abs(.resid), n=2),
+            col="red", size=2) +
+  geom_text_repel(data = analysis1_aug |> 
+                    slice_max(abs(.resid), n = 2), 
+                  aes(label = county), size=3) +
+  geom_smooth(method = "lm", col = "red",
+              formula = y ~ x, se = FALSE) + 
+  geom_smooth(method = "loess", col = "blue",
+              formula = y ~ x, se = FALSE) +
+  geom_point(data = analysis1_aug |> filter(county == "Cuyahoga County"),
+col = "green", size = 4) +
+  geom_label_repel(data = analysis1_aug |> filter(county == "Cuyahoga County"),
+aes(label = "Cuyahoga County"), col = "green") +
+  labs(title = "Model 1 Residuals vs. Fitted Values of Life expectancy", 
+       x = "Fitted values", y = "Residuals")
+  
+
+analysis1_plot3 <- ggplot(analysis1_aug, aes(sample = .resid)) +
+  geom_qq() + geom_qq_line(col = "red") + 
+  labs(title = "Life expectancy Residuals",
+       y = "")
+
+analysis1_plot2 / analysis1_plot3 + plot_layout(heights = c(1,2))
+```
+**Residual VS Fitted** - The data points are distributed above and below x-axis and but doesn't appear to have a fuzzy football or curve shaped pattern. The variability is also pretty much the same throughout the plot. 
+The residual plot doesn't indicate if any of the assumptions about my model are false. 
+
+**Q-Q Plot** - The residuals on the QQ plot looks fairly normally distributed with light tails on both ends.Also, there are a few outliers on both ends. 
+
+### Prediction for Cuyahoga County, OH
+```{r}
+
+analysis1_aug |>
+  filter(county == "Cuyahoga County") |>
+  select(state, county, life_expectancy, .fitted, .resid, physical_inactivity) |> 
+  kable(digits = c(0,0,2,2,2,0)) |> kable_styling(font_size = 18)
+```
+
+For Cuyahoga county, Ohio, the actual value for life expectancy was 76.49 years and the fitted value that my model predicted was 77.86 years which is down by 1.37 years.  
+
+### My Two Least Successfully Fit Counties
+```{r}
+
+analysis1_aug |> 
+filter(county %in% c("Golden Valley County","Kingman County")) |> 
+  select(county, state, physical_inactivity, life_expectancy, .fitted, .resid) |> 
+  kable(digits = c(0,0,2,2,2,0)) |> kable_styling(font_size = 18)
+```
+
+The linear model is least successful at predicting life_expectancy in Kingman County, Kansas and Golden Valley County, North Dakota. The fitted values are 78.34 and 77.75 years of age respectively, while their actual values are 66.00 and 91.38 years.
+
+## Conclusions and Limitations
+
+My research question was- What is the nature of the association between physical inactivity and life expectancy, in 319 counties in the states of OH, MS, KS, ND?
+Using the linear model, it can be concluded that there is a negative association between physical inactivity and life expectancy. This implies that as the proportion of adults with no leisure time for physical activity increases, average life expectancy decreases. However, based on the R-squared value only 46% (which is quite low) of this variation in life expectancy can be explained using linear model with physical inactivity. Moreover, the 90% confidence interval (87.1, 89.6) for my point estimate for life expectancy mean i.e., 88.4, is quite close ranged, which clearly indicates that there is no zero. The residual plot also doesn't indicate if any of the assumptions about my model are false. 
+
+There are certain limitations to my analysis. The sample size of my counties i.e., 319 is not large enough to represent the other counties in the Midwest of the United States. Population behavior could vary among different terrains in the Midwest, leading to different results in my regression analysis. For instance, factors like income and neighborhood may contribute as confounders. People with low income and poor neighborhood may not have adequate facilities like gym, side walks and parks in their locality, which eventually adds to physical inactivity. 
+
+# Analysis 2
+
+## The Variables
+In analysis 2, I will be using mhi_cat (variable 5) as my predictor to measure my outcome of interest i.e., life_expectancy (variable 1). The mhi_cat variable (multi-categorical predictor) indicates three levels of median household income (in $) i.e., low, middle and high. While, the life expectancy variable indicates the average number of years from birth a person can expect to live. 
+
+Using mosaic favstats, I have created a tibble for my outcome i.e., life expectancy in the four states KS, MS, ND and OH to check for complete cases.
+```{r}
+mosaic::favstats(life_expectancy ~ state, data = chr_2022) |>
+    kable(dig=2) |> kable_styling(font_size = 18)
+```
+
+In the four states of OH, MS, KS and ND, 319 counties have complete data for my outcome i.e., life expectancy.
+
+Using tabyl and gt functions, I have created a table for my multi-category predictor i.e., mhi_cat segregating by all three categories in the four states KS, MS, ND and OH to check for complete cases.
+```{r}
+chr_2022 |>
+tabyl(state, mhi_cat) |>
+adorn_totals(where = c("row", "col")) |>
+gt()|>
+gt_theme_nytimes() |>
+tab_header(title = "#Counties in MHI categories in states of KS, MS, ND and OH")
+```
+
+In my four states, OH (88), KS (102), MS (81) and ND (48) have complete data on 319 counties for my multi category predictor (median household income) with three levels - low (107), middle (107) and high (105). 
+
+```{r}
+chr_2022 |>
+    filter(state == "OH") |>
+    filter(county == "Cuyahoga County") |>
+    select(state, county, life_expectancy, mhi_cat)|>
+    kable(dig=2) |> kable_styling(font_size = 18)
+```
+
+In Cuyahoga county, Ohio, the individuals with life expectancy of 76.48 years lies in middle MHI (median household income) category.
+
+## Research Question
+
+Which of median household income categories is associated with the highest mean level of life expectancy, in 319 counties in the states of KS, MS, ND and OH? 
+
+## Data Visualization
+
+I have filtered complete cases and created analysis2. Since, only 3 counties have missing values for my outcome (i.e., life expectancy) which is quiet a small number, that is why, I decided not to impute the data. 
+Using complete cases, I have created a violin box plot for my outcome and predictor.
+
+```{r}
+analysis2 <- chr_2022 |> filter(complete.cases(median_household_income, life_expectancy, state))
+
+analysis2_plot1 <- ggplot(data = analysis2, aes(x = mhi_cat, y = life_expectancy)) +
+  geom_violin(aes(fill = mhi_cat)) +
+  geom_boxplot(width = 0.3) +
+  scale_fill_viridis_d(begin = 0.7, option = "A") +
+  guides(fill = "none", col = "none") +
+  labs(title = "Life expectancy by median household income categories",
+       subtitle= "High income level associated with high life expectancy",
+       caption = "In 319 counties of MS, KS, OH and ND",
+       y = "Average life expectancy (in years)", x = "Median household income (in $)")
+
+analysis2_plot1
+```
+
+The violin box plot shows the relationship between median household income categories and life expectancy. It shows the median value of low income category is the lowest, followed by middle income category and high median income level category. The high median household income category is associated with highest mean level of life expectancy. There are few outliers in all three categories.
+
+## The Fitted Model
+
+### The Prediction Equation
+
+```{r}
+
+analysis2_model <- lm(life_expectancy ~ mhi_cat, data = analysis2)
+extract_eq(analysis2_model, wrap= TRUE, use_coefs = TRUE, coef_digits = 2)
+```
+
+The straight line model for these data fitted by least squares is life expectancy = 73.63 + 2.98(mhi_cat_middle) + 4.38(mhi_cat_high). The slope of mhi_cat is positive, which indicates that as median household income increases, we expect that average life expectancy increases too. Specifically, we expect that for every additional increase in mhi_cat_middle, the average life expectancy will be 2.98 years longer. While, for additional increase in mhi_cat_high, the average life expectancy will increase by 4.38 years. 
+
+### The Model Coefficients
+```{r}
+
+m2 <-lm(life_expectancy ~ mhi_cat, data = analysis2)
+tidy(m2, conf.int = TRUE, conf.level = 0.90) |>
+ kable(dig=1) |> kable_styling(font_size = 18)
+```
+
+In m2, my point estimate for life expectancy mean is 73.6 and the slope of my predictor is positive, which implies that for every additional increase in mhi_cat_middle the prediction says that there is an expected increase in 3 years in life expectancy and the 90% confidence level around it is 2.4 and 3.6 years. Similarly for every additional increase in mhi_cat_high the prediction says that there is an expected increase in 4.4 years in life expectancy and the 90% confidence level around it is 3.8 and 5 years. 
+
+### Summaries of Model Fit
+```{r}
+glance(m2) |> 
+  select(r.squared, sigma, nobs, df, df.residual) |>
+   kbl(digits = c(4, 3, 0, 0, 0)) |> kable_styling(font_size = 18)
+```
+
+For 319 observations, the r-squared value for my model m2 is 0.3108, which means 31.08% of the variance in life expectancy among counties is predictable using the three income categories. The residual standard error for my prediction is 2.729 years.
+
+
+## Prediction Analysis
+
+### Residual Plot
+```{r}
+analysis2_aug <- augment(analysis2_model, data = analysis2)
+
+p1 <- ggplot(analysis2_aug, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, se = F,
+               col = "black") +
+  geom_point(data=analysis2_aug |> 
+               slice_max(abs(.resid), n=2),
+            col="red", size=2) +
+  geom_text_repel(data = analysis2_aug |> 
+                    slice_max(abs(.resid), n = 2), 
+                  aes(label = county), size=3) +
+  geom_point(data = analysis2_aug |> filter(county == "Cuyahoga County"),
+col = "green", size = 4) +
+   geom_label_repel(data = analysis2_aug |> filter(county == "Cuyahoga County"),
+aes(label = "Cuyahoga County"), col = "green", size = 3)+
+  labs(title = "Model 2 Residuals vs. Fitted Life Expectancy",
+       x = "Fitted Life Expectancy from Model 2",
+       y = "Residuals from Model 2")
+
+p2 <- ggplot(analysis2_aug, aes(sample = .resid)) +
+  geom_qq() + 
+  geom_qq_line(col = "red") + 
+  facet_grid(~mhi_cat) +
+  labs(title = "Model 2 Residuals",
+       y = "")
+
+
+p1 / p2 
+```
+**Residual VS Fitted** - The data points are distributed above and below x-axis and don't appear to have a fuzzy football or curve shaped pattern. The three different values of fitted life expectancy on the x- axis indicates the three categories of my predictor i.e., low, middle and high. The variability is also pretty much the same throughout the plot. There are two outliers, i.e., Golden Valley County and Kingman County, that are my model's least successful predictions. In conclusion, not much can be interpreted from this residual plot.
+
+**Q-Q Plot** - The QQ plot looks fairly normally distributed for all 3 categories of median household income with light tails on both ends. Also, there are a few outliers on both ends. 
+
+### Prediction for Cuyahoga County, OH
+```{r}
+analysis2_aug |>
+  filter(county == "Cuyahoga County") |>
+  select(state, county, life_expectancy, .fitted, .resid, mhi_cat) |> 
+  kable(digits = c(0,0,2,2,2,0)) |> kable_styling(font_size = 18)
+```
+
+Cuyahoga county, Ohio, lies in the middle MHI category with average life expectancy value of 76.49 years and the fitted value of the model is 76.61 which up by 0.12 years.  
+
+### My Two Least Successfully Fit Counties
+```{r}
+
+analysis2_aug |> 
+filter(county %in% c("Golden Valley County","Kingman County")) |> 
+  select(county, state, mhi_cat, life_expectancy, .fitted, .resid) |> 
+  kable(digits = c(0,0,2,2,2,0)) |> kable_styling(font_size = 18)
+```
+
+The linear model is least successful at predicting life_expectancy in Kingman County, Kansas and Golden Valley County, North Dakota. The fitted values are 78.01 and 76.61 years of age respectively, while their actual values are 66.00 and 91.38 years. 
+
+## Conclusion and Limitations
+My research question was - Which of median household income categories is associated with the highest mean level of life expectancy, in 319 counties in the states of KS, MS, ND and OH? 
+Looking at the violin box plot it is clear that high MHI (median household income) category is associated with the highest mean level of life expectancy in the 319 counties of KS, MS , ND and OH. The R-squared value for my model is 31.08% (which is quite low), that implies that only 31.08% of this variation in life expectancy can be explained using linear model with physical inactivity. The residual plot creates three fitted values for my model i.e., low, medium and high, which doesn't provide sufficient information about my prediction. 
+
+Since the sample size of my counties is 319, generalizing my interpretation for all the Midwestern counties in the United States is not a good idea. Factor like generational wealth may contribute as a confounder. Moreover, the geographical location, another confounder, may contribute to varied distribution of median household income in different states in the Midwest.
+
+# Analysis 3
+
+## The Variables
+In analysis 3, I will be using some_college (variable 3) as my predictor to measure my outcome of interest i.e., life_expectancy (variable 1). The some_college variable (predictor) indicates the % of the population aged 25-44 with some post-secondary education While, the life expectancy variable indicates the average number of years from birth a person can expect to live. 
+```{r}
+mosaic::favstats(life_expectancy ~ state, data = chr_2022) |>
+    select(state, mean, n, missing) |>
+    kable(dig=2) |> kable_styling(font_size = 18) 
+```
+
+In the four states of OH, MS, KS and ND, 319 counties have complete data for my outcome i.e., life expectancy.
+
+```{r}
+mosaic::favstats(some_college ~ state, data = chr_2022) |>
+    select(state, mean,n, missing) |>
+    kable(dig=2) |> kable_styling(font_size = 18)
+```
+
+In the four states of OH, MS, KS and ND, 322 counties have complete data for my outcome i.e., some_college
+
+```{r}
+chr_2022 |>
+    filter(state == "OH") |>
+    filter(county == "Cuyahoga County") |>
+    select(state, county, life_expectancy, some_college) |>
+    kable(digits = 2) |> kable_styling(font_size = 18)
+```
+
+In Cuyahoga county, Ohio, 69.9% of adult population has gone to some college with the population average life expectancy of 76.48 years.
+
+## Research Question
+How well does some_college predict life expectancy after accounting for differences between the states of OH, KS, MS and ND?
+
+## Data Visualization
+I have filtered complete cases and created analysis3. Since, only 3 counties have missing values for my outcome (i.e., life expectancy) which is quiet a small number, that is why, I decided not to impute the data. 
+Using complete cases, I have created a scatter plot for my outcome and predictor for my four states.
+
+```{r}
+analysis3 <- chr_2022 |> filter(complete.cases(some_college, life_expectancy, state))
+
+ggplot(data = analysis3, aes(x = some_college, y = life_expectancy)) +
+    geom_point() +
+    geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +
+    geom_smooth(method = 'loess', formula = y ~ x, color = 'red', se = FALSE) +
+    labs(title = 'Average life expectancy vs % of adult with some college per state',
+         subtitle= "In 319 counties in OH, MS, KS and ND",
+         caption = "linear model in blue and loess in red",
+        x = '% of adult residents with some college',
+        y = 'Average life expectancy (years)') +
+    facet_wrap( ~ state)
+```
+
+The scatter plot depicts the relationship of average life expectancy (outcome) with proportion of individuals who completed some college (quantitative predictor) in 319 counties in the states of OH, KS, MS and ND. Each state shows a positive linear relationship between some_college and life_expectancy but the slopes of my linear model are different in each states suggesting the magnitude of relationship varies across the four states. 
+
+## The Fitted Model
+
+### The Prediction Equation
+I have used fct_relevel function to to order my states, so that Ohio gets the baseline.
+```{r}
+analysis3 <- analysis3 %>% mutate(state = fct_relevel(state, 
+                                 "OH", "MS", "ND", "KS"))
+analysis3_model <- lm(life_expectancy ~ some_college + state, data = analysis3)
+extract_eq(analysis3_model, use_coefs = TRUE, coef_digits = 2)
+```
+The prediction equation indicates that for every 1% increase in some_college, the life_expectancy in Ohio will increase by 0.08 years. Furthermore, for the state Missouri, for every 1% increase in some_college, life_expectancy will decrease by 3.02 years, while for North Dakota and Kansas, it will increase by 1.37 years and 0.11 years respectively.
+
+### The Model Coefficients
+```{r}
+m3 <-lm(life_expectancy ~ some_college + state, data = analysis3)
+tidy(m3, conf.int = TRUE, conf.level = 0.90) |> 
+ kable(dig=2) |> kable_styling(font_size = 18)
+```
+
+### Summaries of Model Fit
+```{r}
+glance(m3) |> 
+  select(r.squared, sigma, nobs, df, df.residual) |>
+   kbl(digits = c(4, 3, 0, 0, 0)) |> kable_styling(font_size = 18)
+```
+
+For 319 observations, the r-squared (squared correlation coefficient) value is 0.398, which implies that around 40% of the variation in life expectancy is explained using this linear model with some college. And, the residual standard error for my prediction is 2.55 years. 
+
+## Residual Analysis
+```{r}
+analysis3_aug <- augment(analysis3_model, data = analysis3)
+
+analysis3_plot2 <- ggplot(analysis3_aug, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", col = "red",
+              formula = y ~ x, se = FALSE) + 
+  geom_smooth(method = "loess", col = "blue",
+              formula = y ~ x, se = FALSE) +
+  geom_point(data=analysis3_aug |> 
+               slice_max(abs(.resid), n=2),
+            col="red", size=2) +
+  geom_text_repel(data = analysis3_aug |> 
+                    slice_max(abs(.resid), n = 2), 
+                  aes(label = county), size=3) +
+  geom_point(data = analysis3_aug |> filter(county == "Cuyahoga County"),
+col = "green", size = 4) +
+   geom_label_repel(data = analysis3_aug |> filter(county == "Cuyahoga County"),
+aes(label = "Cuyahoga County"), col = "green", size = 3)+
+  labs(title = "Life Expectancy: Residuals vs. Fitted Values", 
+       x = "Fitted values", y = "Residuals")
+  
+
+analysis3_plot3 <- ggplot(analysis3_aug, aes(sample = .resid)) +
+  geom_qq() + geom_qq_line(col = "red") + 
+  labs(title = "Residuals",
+       y = "")
+
+analysis3_plot2 / analysis3_plot3
+```
+**Residual VS Fitted** - The data points are distributed above and below x-axis and don't appear to have a fuzzy football or curve shaped pattern. Majority of data points are clustered in the right half (between 75.0 and 80.0) of the plot. The variability is also pretty much the same throughout the plot, with a few outliers. The residual plot doesn't indicate if any of the assumptions about my model are false. 
+
+**Q-Q Plot** - The QQ plot looks fairly normally distributed with light tails on both ends. Also, there are a few outliers on both ends. 
+
+### Prediction for Cuyahoga County, OH
+```{r}
+analysis3_aug |>
+  filter(county == "Cuyahoga County") |>
+  select(state, county, life_expectancy, .fitted, .resid, some_college) |> 
+  kable(digits = c(0,0,2,2,2,0)) |> kable_styling(font_size = 18)
+```
+
+In Cuyahoga county, Ohio, the average life expectancy value is 76.49 years and the fitted value of the model is 77.31 which down by 0.82 years.  
+
+### My Two Least Successfully Fit Counties
+```{r}
+
+analysis3_aug |> 
+filter(county %in% c("Golden Valley County","Edwards County")) |> 
+  select(county, state, some_college, life_expectancy, .fitted, .resid) |> 
+  kable(digits = c(0,0,2,2,2,0)) |> kable_styling(font_size = 18)
+```
+
+The linear model is least successful at predicting life_expectancy in Edwards County, Kansas and Golden Valley County, North Dakota. The fitted values are 77.32 and 79.21 years of age respectively, while their actual values are 64.71 and 91.38 years. 
+
+
+## Conclusions and Limitations
+
+My research question was- How well does some_college predict life expectancy after accounting for differences between the states of OH, KS, MS and ND?
+The scatter plot depicts a positive linear relationship between some_college and life_expectancy in all four states. However, the slope of linear model in all four states varies greatly. The r-squared value explains only 40% variation in my data. 
+
+There are several limitations in my analysis. The sample size is small and by looking at the scatter plot in each state, it is clear that the magnitude of relationship varies greatly in all four states. This suggests that this interpretation might not hold true for all other counties in the Midwestern region. Confounders like income, generational wealth and neighborhood may also contribute to this variation. For example, residents with high income could afford college while residents with low income may not. 
+
+
+# Session Information
+
+Be sure to include the session information.
+
+```{r}
+sessionInfo()
+```
+
+# One Last Note from Dr. Love
+
+Note that there is [a checklist for the final report](https://thomaselove.github.io/431-projectA-2022/check_final.html) as part of the [Examples & Hints page](https://thomaselove.github.io/431-projectA-2022/check_final.html) that includes many things we’ll be looking for in grading. It’s well worth your time to review the checklist before submitting your work.
+
+- And hit F7 in RStudio to run a spell-check, too!
+- Also, be sure to delete this section (Section 10) before submitting your work.
